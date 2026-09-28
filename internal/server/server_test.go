@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sysrqio/switchllm/internal/config"
@@ -126,7 +128,8 @@ func TestFallbackOn429(t *testing.T) {
 			cfg.Routing.SimpleModel: &upstream.HTTPError{Status: 429, Body: "rate limit"},
 		},
 	}
-	s := New(r, stub, metrics.New(false), slog.Default(), false)
+	m := metrics.New(false)
+	s := New(r, stub, m, slog.Default(), false)
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -144,5 +147,89 @@ func TestFallbackOn429(t *testing.T) {
 	}
 	if stub.calls[len(stub.calls)-1] != cfg.Routing.PremiumModel {
 		t.Fatalf("last model %s want premium %s", stub.calls[len(stub.calls)-1], cfg.Routing.PremiumModel)
+	}
+	if m.Snapshot().FallbacksTotal != 1 {
+		t.Fatalf("fallbacks_total=%d want 1", m.Snapshot().FallbacksTotal)
+	}
+}
+
+func TestFallbackOn503_recordsFallbackMetric(t *testing.T) {
+	cfg, _ := config.Load("../../switchllm.yaml")
+	r := router.New(cfg, nil)
+	m := metrics.New(false)
+	stub := &stubClient{
+		live: true,
+		failOn: map[string]error{
+			cfg.Routing.SimpleModel: &upstream.HTTPError{Status: 503, Body: "unavailable"},
+		},
+	}
+	s := New(r, stub, m, slog.Default(), false)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	payload := `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
+	res, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", bytes.NewBufferString(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("status %d", res.StatusCode)
+	}
+	if m.Snapshot().FallbacksTotal != 1 {
+		t.Fatalf("fallbacks_total=%d want 1", m.Snapshot().FallbacksTotal)
+	}
+}
+
+func TestChatCompletions_streamSSE_done(t *testing.T) {
+	cfg, _ := config.Load("../../switchllm.yaml")
+	r := router.New(cfg, nil)
+	s := New(r, upstream.NewMock(), metrics.New(false), slog.Default(), false)
+
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	payload := `{"model":"auto","stream":true,"messages":[{"role":"user","content":"hello"}]}`
+	res, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", bytes.NewBufferString(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("status %d body %s", res.StatusCode, body)
+	}
+	ct := res.Header.Get("Content-Type")
+	if !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("content-type=%q want event-stream", ct)
+	}
+
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	if !strings.Contains(body, "data: ") {
+		t.Fatalf("missing SSE data lines: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("missing [DONE] terminator: %q", body)
+	}
+
+	sc := bufio.NewScanner(strings.NewReader(body))
+	var dataLines int
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, "data: ") && line != "data: [DONE]" {
+			dataLines++
+			payload := strings.TrimPrefix(line, "data: ")
+			var chunk map[string]interface{}
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				t.Fatalf("invalid json chunk %q: %v", payload, err)
+			}
+		}
+	}
+	if dataLines == 0 {
+		t.Fatal("expected at least one JSON SSE chunk before [DONE]")
 	}
 }
